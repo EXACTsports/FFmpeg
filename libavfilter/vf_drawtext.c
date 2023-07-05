@@ -275,6 +275,9 @@ typedef struct DrawTextContext {
     unsigned int fontsize;          ///< font size to use
     unsigned int default_fontsize;  ///< default font size to use
 
+    int letter_spacing;             ///< letter spacing in pixels
+    char* letter_spacing_expr;      ///< expression for letter spacing
+    AVExpr* letter_spacing_pexpr;   ///< parsed expression for letter spacing
     int line_spacing;               ///< lines spacing in pixels
     short int draw_box;             ///< draw box around text - true or false
     char *boxborderw;               ///< box border width (padding)
@@ -348,6 +351,7 @@ static const AVOption drawtext_options[]= {
     {"shadowcolor",    "set shadow color",      OFFSET(shadowcolor.rgba),   AV_OPT_TYPE_COLOR,  {.str="black"}, 0, 0, TFLAGS},
     {"box",            "set box",               OFFSET(draw_box),           AV_OPT_TYPE_BOOL,   {.i64=0},     0, 1, TFLAGS},
     {"boxborderw",     "set box borders width", OFFSET(boxborderw),         AV_OPT_TYPE_STRING, {.str="0"},   0, 0, TFLAGS},
+    {"letter_spacing", "set letter spacing in pixels", OFFSET(letter_spacing_expr), AV_OPT_TYPE_STRING, {.str="0"}, 0, 0, TFLAGS},
     {"line_spacing",   "set line spacing in pixels", OFFSET(line_spacing),  AV_OPT_TYPE_INT,    {.i64=0},     INT_MIN, INT_MAX, TFLAGS},
     {"fontsize",       "set font size",         OFFSET(fontsize_expr),      AV_OPT_TYPE_STRING, {.str=NULL},  0, 0, TFLAGS},
     {"text_align",     "set text alignment",    OFFSET(text_align),         AV_OPT_TYPE_FLAGS,  {.i64=0}, 0, (TA_LEFT|TA_RIGHT|TA_TOP|TA_BOTTOM), TFLAGS, "text_align"},
@@ -1040,8 +1044,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
     av_expr_free(s->fontsize_pexpr);
+    av_expr_free(s->letter_spacing_pexpr);
 
-    s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = NULL;
+    s->x_pexpr = s->y_pexpr = s->a_pexpr = s->fontsize_pexpr = s->letter_spacing_pexpr = NULL;
 
     av_tree_enumerate(s->glyphs, NULL, NULL, glyph_enu_free);
     av_tree_destroy(s->glyphs);
@@ -1083,14 +1088,17 @@ static int config_input(AVFilterLink *inlink)
     av_expr_free(s->x_pexpr);
     av_expr_free(s->y_pexpr);
     av_expr_free(s->a_pexpr);
-    s->x_pexpr = s->y_pexpr = s->a_pexpr = NULL;
+    av_expr_free(s->letter_spacing_pexpr);
+    s->x_pexpr = s->y_pexpr = s->a_pexpr = s->letter_spacing_pexpr = NULL;
 
     if ((ret = av_expr_parse(&s->x_pexpr, expr = s->x_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
         (ret = av_expr_parse(&s->y_pexpr, expr = s->y_expr, var_names,
                              NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
         (ret = av_expr_parse(&s->a_pexpr, expr = s->a_expr, var_names,
-                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0) {
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0 ||
+        (ret = av_expr_parse(&s->letter_spacing_pexpr, expr = s->letter_spacing_expr, var_names,
+                             NULL, NULL, fun2_names, fun2, 0, ctx)) < 0){
         av_log(ctx, AV_LOG_ERROR, "Failed to parse expression: %s \n", expr);
         return AVERROR(EINVAL);
     }
@@ -1579,7 +1587,7 @@ static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
 
     for (l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
-        line_w = POS_CEIL(line->width64, 64);
+        line_w = POS_CEIL(line->width64, 64) + s->letter_spacing * 64;
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
             dummy.fontsize = s->fontsize;
@@ -1983,6 +1991,9 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         y64 = (int)(s->y * 64. + metrics.offset_top64);
     }
 
+    s->letter_spacing = av_expr_eval(s->letter_spacing_pexpr, s->var_values, &s->prng);
+
+
     for (int l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
         HarfbuzzData *hb = &line->hb_data;
@@ -2012,10 +2023,11 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             g_info->shift_y64 = shift_y64;
 
             if (!is_tab) {
-                x += hb->glyph_pos[t].x_advance;
+                x += hb->glyph_pos[t].x_advance + s->letter_spacing * 64;
             } else {
                 int size = s->blank_advance64 * s->tabsize;
                 x = (x / size + 1) * size;
+                x += s->letter_spacing * 64;
             }
             y += hb->glyph_pos[t].y_advance;
         }
