@@ -1566,6 +1566,8 @@ static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
     int line_w, offset_y = 0;
     int clip_x = 0, clip_y = 0;
 
+    s->letter_spacing = av_expr_eval(s->letter_spacing_pexpr, s->var_values, &s->prng);
+
     j_left = !!(s->text_align & TA_LEFT);
     j_right = !!(s->text_align & TA_RIGHT);
     j_top = !!(s->text_align & TA_TOP);
@@ -1586,8 +1588,11 @@ static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
     clip_y = FFMIN(metrics->rect_y + s->box_height + s->bb_bottom, frame->height);
 
     for (l = 0; l < s->line_count; ++l) {
+        TextLine* cur_line = &s->lines[l];
+        HarfbuzzData* hb = &cur_line->hb_data;
         TextLine *line = &s->lines[l];
         line_w = POS_CEIL(line->width64, 64) + s->letter_spacing * 64;
+        line_w = abs(line_w);
         for (g = 0; g < line->hb_data.glyph_count; ++g) {
             info = &line->glyphs[g];
             dummy.fontsize = s->fontsize;
@@ -1613,10 +1618,12 @@ static int draw_glyphs(DrawTextContext *s, AVFrame *frame,
 
             // Offset of the glyph's bitmap in the visible region
             dx = dy = 0;
-            if (x1 < metrics->rect_x - s->bb_left) {
+
+            if (x1 < metrics->rect_x - s->bb_left && s->letter_spacing >= 0) {
                 dx = metrics->rect_x - s->bb_left - x1;
                 x1 = metrics->rect_x - s->bb_left;
             }
+
             if (y1 < metrics->rect_y - s->bb_top) {
                 dy = metrics->rect_y - s->bb_top - y1;
                 y1 = metrics->rect_y - s->bb_top;
@@ -1690,6 +1697,8 @@ static int measure_text(AVFilterContext *ctx, TextMetrics *metrics)
     int i, tab_idx = 0, last_tab_idx = 0, line_offset = 0;
     char* p;
     int ret = 0;
+
+    s->letter_spacing = av_expr_eval(s->letter_spacing_pexpr, s->var_values, &s->prng);
 
     // Count the lines and the tab characters
     s->tab_count = 0;
@@ -1765,7 +1774,8 @@ continue_on_failed2:
                     first_min_x64 = FFMIN(glyph->bbox.xMin, first_min_x64);
                 }
                 if (t == hb->glyph_count - 1) {
-                    w64 += glyph->bbox.xMax;
+                    w64 += glyph->bbox.xMax + s->letter_spacing*64;
+                    w64 = abs(w64);
                     last_max_x64 = FFMAX(glyph->bbox.xMax, last_max_x64);
                     cur_line->offset_right64 = glyph->bbox.xMax;
                 } else {
@@ -1773,7 +1783,8 @@ continue_on_failed2:
                         int size = s->blank_advance64 * s->tabsize;
                         w64 = (w64 / size + 1) * size;
                     } else {
-                        w64 += hb->glyph_pos[t].x_advance;
+                        w64 += hb->glyph_pos[t].x_advance + s->letter_spacing*64;
+                        w64 = abs(w64);
                     }
                 }
                 cur_min_y64 = FFMIN(glyph->bbox.yMin, cur_min_y64);
@@ -1850,6 +1861,8 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     int last_tab_idx = 0;
 
     TextMetrics metrics;
+
+    s->letter_spacing = av_expr_eval(s->letter_spacing_pexpr, s->var_values, &s->prng);
 
     av_bprint_clear(bp);
 
@@ -1938,7 +1951,7 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     if (s->draw_box && s->boxborderw) {
         int bbsize[4];
         int count;
-        count = string_to_array(s->boxborderw, bbsize, 4);
+        count = string_to_array(s->boxborderw, bbsize, 4); 
         if (count == 1) {
             s->bb_top = s->bb_right = s->bb_bottom = s->bb_left = bbsize[0];
         } else if (count == 2) {
@@ -1978,11 +1991,21 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             s->x = FFMAX(width - metrics.width - offsetright, 0);
         if (s->y + metrics.height + offsetbottom > height)
             s->y = FFMAX(height - metrics.height - offsetbottom, 0);
+        if (metrics.width < 0) {
+            s->x = FFMAX(width + metrics.width - offsetright, 0);
+        }
+        else if (s->x + metrics.width + offsetright > width) {
+            s->x = FFMAX(width - metrics.width - offsetright, 0);
+        }
     }
 
     x = 0;
     y = 0;
     x64 = (int)(s->x * 64.);
+    if (s->letter_spacing < 0) {
+        x64 += abs(s->letter_spacing * 64);
+        x64 = abs(x64);
+    }
     if (s->y_align == YA_FONT) {
         y64 = (int)(s->y * 64. + s->face->size->metrics.ascender);
     } else if (s->y_align == YA_BASELINE) {
@@ -1990,9 +2013,6 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
     } else {
         y64 = (int)(s->y * 64. + metrics.offset_top64);
     }
-
-    s->letter_spacing = av_expr_eval(s->letter_spacing_pexpr, s->var_values, &s->prng);
-
 
     for (int l = 0; l < s->line_count; ++l) {
         TextLine *line = &s->lines[l];
@@ -2023,11 +2043,10 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
             g_info->shift_y64 = shift_y64;
 
             if (!is_tab) {
-                x += hb->glyph_pos[t].x_advance + s->letter_spacing * 64;
+                x += hb->glyph_pos[t].x_advance + s->letter_spacing*64;
             } else {
                 int size = s->blank_advance64 * s->tabsize;
                 x = (x / size + 1) * size;
-                x += s->letter_spacing * 64;
             }
             y += hb->glyph_pos[t].y_advance;
         }
@@ -2036,7 +2055,7 @@ static int draw_text(AVFilterContext *ctx, AVFrame *frame)
         x = 0;
     }
 
-    metrics.rect_x = s->x;
+    metrics.rect_x = s->x + abs(s->line_spacing * 64);
     if (s->y_align == YA_BASELINE) {
         metrics.rect_y = s->y - metrics.offset_top64 / 64;
     } else {
